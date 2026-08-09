@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>diskburst</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>diskburst</h1>
+    <div id="live-ind" title="FSEvents live updates active" hidden><i></i>live</div>
+    <button id="rescan-btn" class="header-btn" title="Rescan all roots"><span class="glyph">↻</span> rescan</button>
+    <div class="tiles">
+      <div class="tile"><span class="val" id="free-val">—</span><label>free on disk</label></div>
+      <div class="tile"><span class="val" id="scanned-val">—</span><label>scanned</label></div>
+      <div class="tile"><span class="val" id="files-val">—</span><label>files</label></div>
+      <div class="tile"><span class="val" id="status-val">starting…</span><label id="status-sub"></label></div>
+    </div>
+  </header>
+  <div id="scanbar"><div class="spinner"></div><span id="scan-current"></span><button id="cancel-rescan" class="header-btn" hidden>✕ cancel</button></div>
+  <div id="filterbar">
+    <input id="filter-input" type="text" placeholder="filter filenames — press / to focus" spellcheck="false" autocomplete="off">
+    <div class="seg" id="filter-mode">
+      <button data-mode="fuzzy" class="seg-btn active" title="fzf-style fuzzy match">fzf</button>
+      <button data-mode="regex" class="seg-btn" title="regular expression">.*</button>
+      <button data-mode="exact" class="seg-btn" title="plain substring">abc</button>
+    </div>
+    <div id="preset-chips">
+      <button class="chip" data-exts="dng,raw,arw,cr2,cr3,nef,orf,rw2" title="dng raw arw cr2 cr3 nef orf rw2">RAW</button>
+      <button class="chip" data-exts="jpg,jpeg,png,heic,tiff,webp" title="jpg jpeg png heic tiff webp">IMG</button>
+      <button class="chip" data-exts="mp4,mov,mkv,avi,webm,m4v" title="mp4 mov mkv avi webm m4v">VID</button>
+      <button class="chip" data-exts="pt,pth,ckpt,safetensors,gguf,onnx,pkl,distcp,npz" title="pt pth ckpt safetensors gguf onnx pkl distcp npz">MODELS</button>
+      <button class="chip" data-exts="zip,tar,gz,tgz,bz2,7z,rar,dmg,iso,xz,zst,nsp" title="zip tar gz tgz bz2 7z rar dmg iso xz zst nsp">ARCH</button>
+    </div>
+    <span id="filter-summary" hidden></span>
+    <button id="filter-clear" class="header-btn" hidden>✕ clear</button>
+  </div>
+  <div id="crumbbar">
+    <button id="back-btn" class="header-btn" title="Back">←</button>
+    <nav id="breadcrumb"></nav>
+    <button id="age-btn" class="header-btn" title="Color by last-modified age">🕐 age</button>
+    <button id="trash-btn" class="header-btn" title="Zoom to Trash" hidden>🗑 Trash</button>
+    <button id="rescan-dir-btn" class="header-btn" title="Rescan just this folder" hidden><span class="glyph">↻</span> this dir</button>
+    <button id="open-current" class="header-btn" title="Open this folder in Finder" hidden>Open in Finder</button>
+  </div>
+  <main>
+    <section id="chart-wrap">
+      <svg id="sunburst" viewBox="0 0 840 840" role="img" aria-label="Disk usage sunburst"></svg>
+      <div id="age-legend" hidden></div>
+      <div id="tooltip" hidden></div>
+    </section>
+    <aside id="sidebar">
+      <div class="tabs">
+        <button class="tab active" data-tab="contents">Contents</button>
+        <button class="tab" data-tab="top">Largest</button>
+        <button class="tab" data-tab="diff">Changes</button>
+        <button class="tab" data-tab="advisor">Advisor</button>
+        <button class="tab" data-tab="dupes">Dupes</button>
+      </div>
+      <div id="contents" class="panel"></div>
+      <div id="top" class="panel" hidden></div>
+      <div id="diff" class="panel" hidden></div>
+      <div id="advisor" class="panel" hidden></div>
+      <div id="dupes" class="panel" hidden></div>
+      <div id="keyhints">j/k select · h/l out/in · / filter · tab panels · ⏎ Finder · y copy · a age · r rescan dir · R rescan all · esc deselect/clear</div>
+    </aside>
+  </main>
+  <div id="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

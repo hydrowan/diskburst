@@ -1,0 +1,9 @@
+# diskburst config — copy to ~/.config/diskburst/config.toml
+# CLI flags override anything set here.
+
+port = 8890
+roots = ["~", "/Applications", "/Library", "/opt/homebrew", "/private/var"]
+workers = 8         # scan threads; 4-8 is optimal on APFS (more causes GIL contention)
+min_file_mb = 1.0   # retain individual files >= this size (these are filterable by name)
+cache = true        # instant reopen from the last snapshot + background rescan
+live = true         # FSEvents live updates (needs watchdog installed)

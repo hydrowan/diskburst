@@ -1,0 +1,13 @@
+# local working notes (contain machine-specific scan findings — never commit)
+local*
+
+# environments & caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+uv.lock
+
+# OS noise
+.DS_Store
