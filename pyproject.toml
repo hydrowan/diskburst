@@ -6,6 +6,7 @@ license = "Apache-2.0"
 requires-python = ">=3.12"
 dependencies = [
     "watchdog>=4",  # live mode (FSEvents); the app runs without it, live mode off
+    "rich>=13",     # terminal UI (python -m diskburst.tui); the server runs without it
 ]
 
 [dependency-groups]

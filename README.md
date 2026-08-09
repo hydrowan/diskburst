@@ -57,6 +57,23 @@ Persistent settings go in `~/.config/diskburst/config.toml` (see
   design: high-churn system paths are deny-listed and overload is dropped;
   the next full rescan is always authoritative.
 
+## Terminal UI
+
+A rich-based TUI client of the same server, with a live braille-rendered
+sunburst — the selected branch glows on the chart as you move:
+
+```sh
+uv run python -m diskburst.tui
+```
+
+![diskburst TUI — braille sunburst](media/preview_2.png)
+
+Same vim keys as the web UI (j/k/h/l, Enter reveals in Finder, y copies,
+r/R rescan, Tab toggles contents/largest, q quits). Live updates and rescans
+stream in automatically. One-shot renders without the TUI:
+`python -m diskburst.tui.sunburst` (braille to stdout), and an experimental
+iTerm2 inline-image renderer in `diskburst.tui.iterm2`.
+
 ## Keyboard
 
 ```

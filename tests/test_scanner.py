@@ -324,6 +324,64 @@ def test_cache_files_are_owner_only(fixture_tree, monkeypatch, tmp_path_factory)
     assert os.stat(path).st_mode & 0o777 == 0o600
 
 
+def test_tui_compose_renders_without_terminal():
+    pytest.importorskip("rich")
+    from rich.console import Console
+
+    from diskburst.tui.app import TuiApp, shorten_home
+
+    app = TuiApp.__new__(TuiApp)  # no server: build state by hand
+    app.console = Console(width=100, height=30, force_terminal=True)
+    app.renderer = "braille"
+    app.path = "/Users/x/code"
+    app.sel = 0
+    app.tab = "contents"
+    app.message = ""
+    app.status = {
+        "state": "done", "files": 10, "bytes": 5000,
+        "disk": {"free": 1000}, "live": {"enabled": True}, "roots": ["/Users/x"],
+    }
+    app.tree = {
+        "name": "code", "path": "/Users/x/code", "type": "dir", "size": 5000,
+        "children": [
+            {"name": "big", "path": "/Users/x/code/big", "type": "dir", "size": 4000},
+            {"name": "f.bin", "path": "/Users/x/code/f.bin", "type": "file", "size": 1000},
+        ],
+    }
+    app.largest = []
+    with app.console.capture() as cap:
+        app.console.print(app.compose("chart-goes-here"))
+    out = cap.get()
+    assert "diskburst" in out and "big/" in out and "f.bin" in out
+    assert "~/code" in out  # title shortened
+    assert shorten_home("/Users/someone/x") == "~/x"
+    assert shorten_home("/opt/thing") == "/opt/thing"
+
+
+def test_braille_sunburst_renders():
+    from diskburst.tui.sunburst import BRAILLE_BASE, render
+
+    tree = {
+        "name": "All scanned", "path": "", "type": "dir", "size": 1000,
+        "children": [
+            {"name": "/Users/x", "path": "/Users/x", "type": "dir", "size": 700,
+             "children": [
+                 {"name": "Library", "path": "/Users/x/Library", "type": "dir", "size": 400},
+                 {"name": "big.bin", "path": "/Users/x/big.bin", "type": "file", "size": 300},
+             ]},
+            {"name": "/opt", "path": "/opt", "type": "dir", "size": 300},
+        ],
+    }
+    lines = render(tree, width=40, rings=2)
+    assert len(lines) == 20
+    joined = "".join(lines)
+    assert any(BRAILLE_BASE <= ord(c) < BRAILLE_BASE + 256 for c in joined)  # dots drawn
+    assert "\x1b[38;2;" in joined  # truecolor applied
+    assert "1.0 KB" in joined  # center label intact
+    for line in lines:
+        assert not line.rstrip().endswith(";")  # no truncated escape sequences
+
+
 def test_close_mid_scan_still_completes(fixture_tree):
     for _ in range(3):  # close() races worker startup; exercise it a few times
         scanner = Scanner([str(fixture_tree)], workers=4)
