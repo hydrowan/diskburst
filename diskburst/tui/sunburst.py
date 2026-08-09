@@ -145,9 +145,17 @@ def make_classifier(per_depth: dict, hole: float, ring_w: float, rings: int, seg
 
 
 def render(
-    tree: dict, width: int = 80, rings: int = 3, highlight: int | None = None
+    tree: dict,
+    width: int = 80,
+    rings: int = 3,
+    highlight: int | None = None,
+    center: list[str] | None = None,
 ) -> list[str]:
-    """Render the sunburst as ANSI-colored lines (width chars, ~width/2 rows)."""
+    """Render the sunburst as ANSI-colored lines (width chars, ~width/2 rows).
+
+    `center` supplies the lines shown in the hole (first line bold, rest
+    muted); defaults to the tree's total size.
+    """
     w_chars = max(20, width)
     h_chars = w_chars // 2
     dots_w, dots_h = 2 * w_chars, 4 * h_chars
@@ -178,19 +186,29 @@ def render(
                 votes[row][col] = Counter()
             votes[row][col][rgb] += 1
 
-    label = _fmt_bytes(tree.get("size", 0))
-    label_row = h_chars // 2
-    label_col = (w_chars - len(label)) // 2
+    if not center:
+        center = [_fmt_bytes(tree.get("size", 0))]
+    max_len = max(6, int(w_chars * 0.34))  # keep lines inside the hole
+    center = [line[:max_len] for line in center[:4] if line]
+    start_row = h_chars // 2 - len(center) // 2
+    overlays = {
+        start_row + i: ((w_chars - len(text)) // 2, text, i == 0)
+        for i, text in enumerate(center)
+        if 0 <= start_row + i < h_chars
+    }
     lines = []
     for y in range(h_chars):
         parts: list[str] = []
         prev = None
+        overlay = overlays.get(y)
         x = 0
         while x < w_chars:
-            if y == label_row and x == label_col:  # center total, cell-aligned
-                parts.append(f"\x1b[0m\x1b[1m{label}\x1b[22m")
+            if overlay and x == overlay[0]:  # center text, cell-aligned
+                col, text, is_title = overlay
+                style = "\x1b[1m" if is_title else "\x1b[38;2;166;173;200m"
+                parts.append(f"\x1b[0m{style}{text}\x1b[0m")
                 prev = None
-                x += len(label)
+                x += len(text)
                 continue
             bits = chars[y][x]
             if not bits:

@@ -2,15 +2,17 @@
 
 A thin client of the running diskburst server. Single-threaded event loop:
 cbreak keyboard input multiplexed with a 1 s status poll; redraws only on
-change, wrapped in DEC 2026 synchronized updates to avoid flicker.
+change. (Deliberately no DEC 2026 synchronized updates — iTerm2 can drop the
+commit half mid-resize, freezing the display.)
 
     python -m diskburst.tui [--port N] [--renderer braille|image]
 
 Braille is the default renderer; the iTerm2 inline-image renderer stays
-available behind --renderer image (or the i key) as an experiment.
+available behind --renderer image as an experiment.
 
 Keys: j/k select · h/l out/in · g/G ends · Tab contents/largest · ⏎ Finder
-      y copy path · r rescan dir · R rescan all · i toggle renderer · q quit
+      y copy path · r rescan dir · R rescan all · q quit
+      0 header/footer · 1 chart · 2 list · 3 selected  (btop-style toggles)
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import select
+import signal
 import subprocess
 import sys
 import termios
@@ -83,6 +86,8 @@ class TuiApp:
         self._png: bytes | None = None
         self._last_poll = 0.0
         self._seen_change = 0.0
+        self.chrome = True  # header + footer (window 0)
+        self.visible = {1: True, 2: True, 3: True}  # chart, list, selected
 
     # ------------------------------------------------------------- data
 
@@ -174,42 +179,72 @@ class TuiApp:
         elif key == "R":
             self.client.post("/api/rescan")
             self.toast("full rescan started")
-        elif key == "i":
-            self.renderer = "image" if self.renderer == "braille" else "braille"
+        elif key == "0":
+            self.chrome = not self.chrome
+        elif key in ("1", "2", "3"):
+            n = int(key)
+            self.visible[n] = not self.visible[n]
+            if not any(self.visible.values()):
+                self.visible[n] = True  # never collapse everything
         return True
 
-    def _selected_path(self) -> str:
+    def _selected_item(self) -> dict | None:
         if self.tab == "largest":
             if self.sel < len(self.largest):
-                return self.largest[self.sel].get("path", "")
-            return ""
+                f = self.largest[self.sel]
+                return {"name": f["path"].rsplit("/", 1)[-1], "path": f["path"],
+                        "type": "file", "size": f["size"], "mtime": f.get("mtime")}
+            return None
         items = self.items()
-        return items[self.sel].get("path", "") if self.sel < len(items) else ""
+        return items[self.sel] if self.sel < len(items) else None
+
+    def _selected_path(self) -> str:
+        item = self._selected_item()
+        return (item or {}).get("path", "")
 
     # ---------------------------------------------------------- drawing
 
+    def sidebar_width(self) -> int:
+        if not self.visible[1]:
+            return self.console.size.width  # chart collapsed: side takes it all
+        return min(SIDEBAR_WIDTH, max(28, self.console.size.width // 3))
+
     def compose(self, chart_text: Text | str) -> Layout:
         layout = Layout()
-        layout.split_column(
-            Layout(self._header(), name="header", size=1),
-            Layout(name="body", ratio=1),
-            Layout(self._footer(), name="footer", size=1),
-        )
-        title = Text(shorten_home(self.path) or "All scanned", style=f"bold {MOCHA['text']}")
-        chart = chart_text if isinstance(chart_text, str) else Align.center(
-            chart_text, vertical="middle"
-        )
-        layout["body"].split_row(
-            Layout(
+        rows = [Layout(name="body", ratio=1)]
+        if self.chrome:
+            rows = [Layout(self._header(), name="header", size=1), *rows,
+                    Layout(self._footer(), name="footer", size=1)]
+        layout.split_column(*rows)
+
+        title = Text(f"1 · {shorten_home(self.path) or 'All scanned'}",
+                     style=f"bold {MOCHA['text']}")
+        if isinstance(chart_text, str):
+            chart = chart_text
+        else:
+            chart_text.no_wrap = True
+            chart_text.overflow = "crop"  # a mid-resize oversized chart crops, never wraps
+            chart = Align.center(chart_text, vertical="middle")
+        columns = []
+        if self.visible[1]:
+            columns.append(Layout(
                 Panel(chart, title=title, border_style=MOCHA["muted"]),
                 name="chart", ratio=1,
-            ),
-            Layout(name="side", size=SIDEBAR_WIDTH),
-        )
-        layout["side"].split_column(
-            Layout(self._sidebar(), name="list", ratio=1),
-            Layout(self._info_panel(), name="info", size=9),
-        )
+            ))
+        if self.visible[2] or self.visible[3]:
+            columns.append(Layout(name="side", size=self.sidebar_width()))
+        layout["body"].split_row(*columns)
+
+        if self.visible[2] or self.visible[3]:
+            side_rows = []
+            if self.visible[2]:
+                side_rows.append(Layout(self._sidebar(), name="list", ratio=1))
+            if self.visible[3]:
+                info_size = 9 if self.visible[2] else None
+                side_rows.append(
+                    Layout(self._info_panel(), name="info", size=info_size)
+                )
+            layout["side"].split_column(*side_rows)
         return layout
 
     def _header(self) -> Text:
@@ -230,7 +265,7 @@ class TuiApp:
     def _footer(self) -> Text:
         hints = (
             " j/k select · h/l out/in · tab contents/largest · ⏎ finder · y copy"
-            " · r rescan dir · R rescan all · i renderer · q quit"
+            " · r/R rescan · 0-3 toggle windows · q quit"
         )
         return Text(hints, style=MOCHA["muted"], no_wrap=True)
 
@@ -262,7 +297,7 @@ class TuiApp:
                 for part in (marker, label, size):
                     part.stylize("on #262636")
             table.add_row(marker, label, size)
-        return Panel(table, title="contents", border_style=MOCHA["muted"])
+        return Panel(table, title="2 · contents", border_style=MOCHA["muted"])
 
     def _largest_panel(self):
         table = Table.grid(padding=(0, 1))
@@ -277,20 +312,14 @@ class TuiApp:
                 name.stylize("reverse")
                 size.stylize("reverse")
             table.add_row(name, size)
-        return Panel(table, title="largest files", border_style=MOCHA["muted"])
+        return Panel(table, title="2 · largest files", border_style=MOCHA["muted"])
 
     def _info_panel(self) -> Panel:
         body = Text(no_wrap=False)
         if self.message:
             body.append("▸ ", style=MOCHA["mauve"])
             body.append(self.message + "\n\n", style=f"bold {MOCHA['mauve']}")
-        item = None
-        if self.tab == "largest" and self.sel < len(self.largest):
-            f = self.largest[self.sel]
-            item = {"name": f["path"].rsplit("/", 1)[-1], "path": f["path"],
-                    "type": "file", "size": f["size"], "mtime": f.get("mtime")}
-        elif self.tab == "contents" and self.sel < len(self.items()):
-            item = self.items()[self.sel]
+        item = self._selected_item()
         if item is not None:
             total = max(self.tree.get("size", 0), 1)
             pct = item.get("size", 0) / total * 100
@@ -304,32 +333,57 @@ class TuiApp:
                 body.append(f"\nmodified {fmt_age(mtime)}", style=MOCHA["sub"])
             if item.get("path"):
                 body.append(f"\n{shorten_home(item['path'])}", style=MOCHA["muted"])
-        return Panel(body, title="selected", border_style=MOCHA["muted"])
+        return Panel(body, title="3 · selected", border_style=MOCHA["muted"])
 
     def toast(self, message: str) -> None:
         self.message = message
         self._message_at = time.monotonic()
 
-    def draw(self, screen) -> None:
-        sys.stdout.write("\x1b[?2026h")  # begin synchronized update (no flicker)
-        try:
-            size = self.console.size
-            chart_cols = size.width - SIDEBAR_WIDTH - 4
-            chart_rows = size.height - 4
-            if self.renderer == "image":
-                screen.update(self.compose(""))
+    def _center_lines(self) -> list[str] | None:
+        item = self._selected_item()
+        if item is None or item.get("type") == "rest":
+            return None  # engine falls back to the view total
+        total = max(self.tree.get("size", 0), 1)
+        lines = [item.get("name", "?"),
+                 f"{_fmt_bytes(item.get('size', 0))} · {item.get('size', 0) / total * 100:.0f}%"]
+        if item.get("type") == "dir" and item.get("files"):
+            lines.append(f"{item['files']:,} files")
+        mtime = item.get("mtime") or item.get("newest")
+        if mtime:
+            lines.append(fmt_age(mtime))
+        return lines
+
+    def draw(self, screen, clear: bool = False) -> None:
+        size = self.console.size
+        if clear:
+            # after a resize settles: multiplexers (zellij) keep stale cells in
+            # newly exposed regions; a clear immediately followed by a full
+            # frame is safe once the drag has ended
+            sys.stdout.write("\x1b[2J\x1b[H")
+        if size.width < 44 or size.height < 10:
+            screen.update(Align.center(
+                Text("terminal too small for diskburst", style=MOCHA["muted"]),
+                vertical="middle",
+            ))
+            return
+        side = self.sidebar_width() if (self.visible[2] or self.visible[3]) else 0
+        # exact inner size of the chart panel: borders eat 2 cols + 2 rows,
+        # header/footer eat 2 rows when visible
+        chart_cols = size.width - side - 2
+        chart_rows = size.height - 2 - (2 if self.chrome else 0)
+        if self.renderer == "image":
+            screen.update(self.compose(""))
+            if self.visible[1]:
                 self._draw_image(chart_cols, chart_rows)
-            else:
-                width = max(24, min(chart_cols, chart_rows * 2) - 2)
-                highlight = None
-                if self.tab == "contents" and self.sel < len(self.items()):
-                    if self.items()[self.sel].get("type") != "rest":
-                        highlight = self.sel
-                lines = render(self.tree, width=width, rings=3, highlight=highlight)
-                screen.update(self.compose(Text.from_ansi("\n".join(lines))))
-        finally:
-            sys.stdout.write("\x1b[?2026l")
-            sys.stdout.flush()
+        else:
+            width = max(10, min(chart_cols, chart_rows * 2))
+            highlight = None
+            if self.tab == "contents" and self.sel < len(self.items()):
+                if self.items()[self.sel].get("type") != "rest":
+                    highlight = self.sel
+            lines = render(self.tree, width=width, rings=3,
+                           highlight=highlight, center=self._center_lines())
+            screen.update(self.compose(Text.from_ansi("\n".join(lines))))
 
     def _draw_image(self, chart_cols: int, chart_rows: int) -> None:
         if self._png is None:
@@ -357,20 +411,24 @@ def fmt_age(mtime: float) -> str:
     return f"{days / 365:.1f}y ago"
 
 
-def read_key(fd: int) -> str:
-    data = os.read(fd, 8)
-    if data == b"\x1b[A":
-        return "UP"
-    if data == b"\x1b[B":
-        return "DOWN"
-    if data == b"\x1b[C":
-        return "RIGHT"
-    if data == b"\x1b[D":
-        return "LEFT"
-    try:
-        return data.decode()
-    except UnicodeDecodeError:
-        return ""
+ARROWS = {65: "UP", 66: "DOWN", 67: "RIGHT", 68: "LEFT"}
+
+
+def read_keys(fd: int) -> list[str]:
+    """Parse every key out of the input buffer — autorepeat delivers bursts."""
+    data = os.read(fd, 256)
+    keys: list[str] = []
+    i = 0
+    while i < len(data):
+        if data[i] == 0x1B and i + 2 < len(data) and data[i + 1] == 0x5B:
+            arrow = ARROWS.get(data[i + 2])
+            if arrow:
+                keys.append(arrow)
+            i += 3
+        else:
+            keys.append(chr(data[i]))
+            i += 1
+    return keys
 
 
 def main() -> None:
@@ -399,16 +457,35 @@ def main() -> None:
     fd = sys.stdin.fileno()
     old_attrs = termios.tcgetattr(fd)
     tty.setcbreak(fd)
+    resized = [False]
+    signal.signal(signal.SIGWINCH, lambda *_: resized.__setitem__(0, True))
     try:
         with app.console.screen() as screen:
             app.draw(screen)
             running = True
+            settle_at = 0.0  # one extra redraw after a resize storm ends
             while running:
                 ready, _, _ = select.select([sys.stdin], [], [], 0.25)
                 dirty = False
+                if resized[0]:
+                    resized[0] = False
+                    # debounce: no drawing DURING a drag (the terminal may not
+                    # drain our writes mid-resize, blocking the whole loop) —
+                    # draw once after resize events pause
+                    settle_at = time.monotonic() + 0.25
+                needs_clear = False
+                if settle_at and time.monotonic() >= settle_at:
+                    settle_at = 0.0
+                    dirty = True
+                    needs_clear = True  # repaint from scratch at the new size
                 if ready:
-                    key = read_key(fd)
-                    running = app.handle(key)
+                    for key in read_keys(fd):
+                        try:
+                            running = app.handle(key)
+                        except OSError as exc:  # server briefly unreachable etc.
+                            app.toast(f"error: {exc}")
+                        if not running:
+                            break
                     dirty = True
                 if app.message and time.monotonic() - app._message_at > 3.0:
                     app.message = ""  # toasts expire on their own
@@ -423,6 +500,6 @@ def main() -> None:
                     elif app.status.get("state") != "done":
                         dirty = True  # keep the header counters moving mid-scan
                 if dirty and running:
-                    app.draw(screen)
+                    app.draw(screen, clear=needs_clear)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)

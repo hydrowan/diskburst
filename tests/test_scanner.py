@@ -337,6 +337,8 @@ def test_tui_compose_renders_without_terminal():
     app.sel = 0
     app.tab = "contents"
     app.message = ""
+    app.chrome = True
+    app.visible = {1: True, 2: True, 3: True}
     app.status = {
         "state": "done", "files": 10, "bytes": 5000,
         "disk": {"free": 1000}, "live": {"enabled": True}, "roots": ["/Users/x"],
