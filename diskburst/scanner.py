@@ -1,10 +1,13 @@
 """Threaded, strictly read-only disk usage scanner.
 
 Walks directory trees with os.scandir on a worker pool, accumulating
-allocated-block sizes (st_blocks * 512 — the space you would actually free).
-Never follows symlinks, never crosses filesystem boundaries, counts
-hardlinked files once. The tree stays queryable while the scan runs;
-cumulative totals are refreshed periodically and finalized on completion.
+allocated-block sizes (st_blocks * 512). Never follows symlinks, never crosses
+filesystem boundaries, counts hardlinked files once. The tree stays queryable
+while the scan runs; cumulative totals are refreshed periodically and
+finalized on completion. With `clone_aware`, macOS scans list directories via
+getattrlistbulk and also compute APFS clone-aware unique and freed sizes; there
+apparent size and file count include every hard-link name, and unique counts
+each inode once.
 """
 
 from __future__ import annotations
@@ -16,21 +19,34 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+from . import bulk_listing
+from .clones import CloneLedger
+
 BLOCK_BYTES = 512
 # Benchmarked on M-series/APFS: 4-8 workers ~100k entries/s warm; 12+ degrades
 # (GIL handoff convoy), 48 was 1.7x SLOWER than 8. The kernel serializes APFS
 # metadata ops past ~2 cores anyway, so more threads only add contention.
 DEFAULT_WORKERS = 8
 DEFAULT_BIG_FILE_BYTES = 1 * 1000 * 1000  # retain individual files >= 1 MB (filterable by name)
+BULK_LISTING_ATTEMPTS = 2
 
 
 @dataclass(slots=True)
 class DirNode:
-    """One directory. `own_bytes` covers entries directly inside; totals are cumulative."""
+    """One directory. `own_*` cover entries directly inside; totals are cumulative.
+
+    unique: bytes counting each APFS clone group once. freed: bytes released if
+    this directory alone were deleted. Both equal the apparent size without
+    clone data, and own_unique / own_freed include clone-group corrections.
+    """
 
     name: str
     own_bytes: int = 0
     total_bytes: int = 0
+    own_unique: int = 0
+    unique_bytes: int = 0
+    own_freed: int = 0
+    freed_bytes: int = 0
     file_count: int = 0
     total_files: int = 0
     own_newest: float = 0.0  # newest mtime among direct files
@@ -46,6 +62,7 @@ class ScanStats:
     dirs: int = 0
     bytes: int = 0
     errors: int = 0
+    listing_failures: int = 0  # bulk listings that failed and fell back to os.scandir
     current_path: str = ""
 
 
@@ -57,6 +74,8 @@ class Scanner:
         root_paths: list[str],
         big_file_bytes: int = DEFAULT_BIG_FILE_BYTES,
         workers: int = DEFAULT_WORKERS,
+        clone_aware: bool = False,
+        refresh_totals: bool = True,
     ):
         self.root_paths = [os.path.abspath(os.path.expanduser(p)) for p in root_paths]
         self.roots: dict[str, DirNode] = {p: DirNode(name=p) for p in self.root_paths}
@@ -72,6 +91,8 @@ class Scanner:
         self._hardlink_lock = threading.Lock()
         self._seen_hardlinks: set[tuple[int, int]] = set()
         self._cancelled = False
+        self.refresh_totals = refresh_totals
+        self.clone_ledger = CloneLedger() if clone_aware and bulk_listing.AVAILABLE else None
 
     def start(self) -> None:
         for path, node in self.roots.items():
@@ -84,7 +105,8 @@ class Scanner:
             self._queue.put((node, path, dev))
         for _ in range(self.workers):
             threading.Thread(target=self._worker, daemon=True).start()
-        threading.Thread(target=self._refresher, daemon=True).start()
+        if self.refresh_totals:
+            threading.Thread(target=self._refresher, daemon=True).start()
         threading.Thread(target=self._completion_watcher, daemon=True).start()
 
     @property
@@ -125,7 +147,8 @@ class Scanner:
             node, path, dev = item
             try:
                 if not self._cancelled:
-                    self._scan_dir(node, path, dev)
+                    scan = self._scan_dir if self.clone_ledger is None else self._scan_dir_bulk
+                    scan(node, path, dev)
             finally:
                 self._queue.task_done()
 
@@ -156,7 +179,7 @@ class Scanner:
                         node.children[entry.name] = child
                         self._queue.put((child, entry.path, dev))
                     elif entry.is_file(follow_symlinks=False):
-                        if st.st_nlink > 1 and not self._claim_hardlink(st):
+                        if st.st_nlink > 1 and not self._claim_hardlink((st.st_dev, st.st_ino)):
                             continue
                         size = st.st_blocks * BLOCK_BYTES
                         own += size
@@ -167,6 +190,70 @@ class Scanner:
                             node.big_files.append((entry.name, size, st.st_mtime))
                 except OSError:
                     nerrors += 1
+        node.own_unique = node.own_freed = own
+        self._finish_dir(node, path, own, nfiles, newest, nerrors)
+
+    def _list_bulk(self, path: str) -> list[tuple] | None:
+        for _ in range(BULK_LISTING_ATTEMPTS):
+            try:
+                return bulk_listing.list_directory(path)
+            except OSError:
+                continue
+        with self._stats_lock:
+            self.stats.listing_failures += 1
+        return None
+
+    def _scan_dir_bulk(self, node: DirNode, path: str, dev: int) -> None:
+        entries = self._list_bulk(path)
+        if entries is None:
+            self._scan_dir(node, path, dev)
+            return
+        own = unique = freed = nfiles = nerrors = 0
+        newest = 0.0
+        clones: list[tuple] = []
+        links: list[tuple] = []
+        for (objtype, name, entry_dev, mtime, fileid, nlink, alloc, private, cloneid, refcnt,
+             is_mount) in entries:
+            if objtype == bulk_listing.VDIR:
+                if entry_dev != dev or is_mount:
+                    continue
+                own += alloc
+                unique += alloc
+                freed += alloc
+                child = DirNode(name=name)
+                node.children[name] = child
+                self._queue.put((child, os.path.join(path, name), dev))
+                continue
+            if objtype != bulk_listing.VREG:
+                continue
+            if alloc < 0:
+                nerrors += 1
+                continue
+            own += alloc
+            nfiles += 1
+            if mtime > newest:
+                newest = mtime
+            if alloc >= self.big_file_bytes:
+                node.big_files.append((name, alloc, mtime))
+            if nlink > 1:
+                links.append((entry_dev, fileid, nlink, alloc, private, cloneid, refcnt))
+            elif refcnt > 1:
+                clones.append((cloneid, alloc, private, refcnt))
+                freed += private
+            else:
+                unique += alloc
+                # refcnt 1 with private < alloc is a modified clone still sharing blocks;
+                # refcnt 0 (e.g. decmpfs-compressed) reports no usable private size.
+                freed += private if refcnt == 1 else alloc
+        if clones or links:
+            self.clone_ledger.record(node, clones, links)
+        node.own_unique = unique
+        node.own_freed = freed
+        self._finish_dir(node, path, own, nfiles, newest, nerrors)
+
+    def _finish_dir(
+        self, node: DirNode, path: str, own: int, nfiles: int, newest: float, nerrors: int
+    ) -> None:
         node.own_bytes = own
         node.file_count = nfiles
         node.own_newest = newest
@@ -179,8 +266,7 @@ class Scanner:
             self.stats.errors += nerrors
             self.stats.current_path = path
 
-    def _claim_hardlink(self, st: os.stat_result) -> bool:
-        key = (st.st_dev, st.st_ino)
+    def _claim_hardlink(self, key: tuple[int, int]) -> bool:
         with self._hardlink_lock:
             if key in self._seen_hardlinks:
                 return False
@@ -191,6 +277,8 @@ class Scanner:
 
     def _completion_watcher(self) -> None:
         self._queue.join()
+        if self.clone_ledger is not None and not self._cancelled:
+            self.clone_ledger.apply(list(self.roots.values()))
         for node in self.roots.values():
             compute_totals(node)
         self.finished_in = time.monotonic() - self.started_at
@@ -253,14 +341,20 @@ def compute_totals(root: DirNode) -> None:
         node, visited = stack.pop()
         if visited:
             total = node.own_bytes
+            unique = node.own_unique
+            freed = node.own_freed
             files = node.file_count
             newest = node.own_newest
             for child in list(node.children.values()):
                 total += child.total_bytes
+                unique += child.unique_bytes
+                freed += child.freed_bytes
                 files += child.total_files
                 if child.newest > newest:
                     newest = child.newest
             node.total_bytes = total
+            node.unique_bytes = unique
+            node.freed_bytes = freed
             node.total_files = files
             node.newest = newest
         else:

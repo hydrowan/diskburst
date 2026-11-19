@@ -176,6 +176,10 @@ def _encode(root: DirNode) -> dict:
         out["n"] = node.name
         out["o"] = node.own_bytes
         out["f"] = node.file_count
+        if node.own_unique != node.own_bytes:
+            out["u"] = node.own_unique
+        if node.own_freed != node.own_bytes:
+            out["r"] = node.own_freed
         if node.own_newest:
             out["m"] = node.own_newest
         if node.error:
@@ -201,6 +205,8 @@ def _decode(encoded: dict) -> tuple[DirNode, int]:
         count += 1
         node.own_bytes = enc["o"]
         node.file_count = enc["f"]
+        node.own_unique = enc.get("u", node.own_bytes)
+        node.own_freed = enc.get("r", node.own_bytes)
         node.own_newest = enc.get("m", 0.0)
         node.error = bool(enc.get("e"))
         node.big_files = [(name, size, mtime) for name, size, mtime in enc.get("b", [])]
